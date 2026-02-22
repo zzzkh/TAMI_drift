@@ -28,6 +28,7 @@ from utils.EarlyStopping import EarlyStopping
 from utils.load_configs import get_link_prediction_args
 from collections import defaultdict
 from utils.drifting_field import compute_V_multi_temperature
+from algo import HALT
 
 if __name__ == "__main__":
 
@@ -199,6 +200,19 @@ if __name__ == "__main__":
         # Drifting loss: positive dst embedding bank (GPU ring buffer)
         pos_dst_bank = None
 
+        halt = HALT(
+            base_negative_sampler=train_neg_edge_sampler,
+            neighbor_sampler=train_neighbor_sampler,
+            num_negatives=args.halt_num_negatives,
+            hard_ratio=args.halt_hard_ratio,
+            neighbor_k=args.num_neighbors,
+            base_tau=args.halt_base_tau,
+            tau_alpha=args.halt_tau_alpha,
+            tau_min=args.halt_tau_min,
+            tau_max=args.halt_tau_max,
+            device=args.device,
+        )
+
         for epoch in range(args.num_epochs):
             model.train()
 
@@ -214,6 +228,8 @@ if __name__ == "__main__":
                 # reinitialize memory of memory-based models at the start of each epoch
                 model[0].memory_bank.__init_memory_bank__()
 
+            halt.reset_state()
+
             # store train losses and metrics
             train_losses, train_metrics = [], []
             train_idx_data_loader_tqdm = tqdm(train_idx_data_loader, ncols=120)
@@ -224,8 +240,9 @@ if __name__ == "__main__":
                     train_data.src_node_ids[train_data_indices], train_data.dst_node_ids[train_data_indices], \
                     train_data.node_interact_times[train_data_indices], train_data.edge_ids[train_data_indices]
 
-                _, batch_neg_dst_node_ids = train_neg_edge_sampler.sample(size=len(batch_src_node_ids))
-                batch_neg_src_node_ids = batch_src_node_ids
+                batch_neg_src_node_ids, batch_neg_dst_node_ids, batch_neg_node_interact_times, _ = halt.sample_negatives(
+                    batch_src_node_ids, batch_dst_node_ids, batch_node_interact_times
+                )
 
                 # ========================================================================
                 # we need to compute for positive and negative edges respectively, because the new sampling strategy (for evaluation) allows the negative source nodes to be
@@ -244,7 +261,7 @@ if __name__ == "__main__":
                     batch_neg_src_node_embeddings, batch_neg_dst_node_embeddings = \
                         model[0].compute_src_dst_node_temporal_embeddings(src_node_ids=batch_neg_src_node_ids,
                                                                           dst_node_ids=batch_neg_dst_node_ids,
-                                                                          node_interact_times=batch_node_interact_times,
+                                                                          node_interact_times=batch_neg_node_interact_times,
                                                                           num_neighbors=args.num_neighbors)
                 elif args.model_name in ['JODIE', 'DyRep', 'TGN']:
                     # note that negative nodes do not change the memories while the positive nodes change the memories,
@@ -254,7 +271,7 @@ if __name__ == "__main__":
                     batch_neg_src_node_embeddings, batch_neg_dst_node_embeddings = \
                         model[0].compute_src_dst_node_temporal_embeddings(src_node_ids=batch_neg_src_node_ids,
                                                                           dst_node_ids=batch_neg_dst_node_ids,
-                                                                          node_interact_times=batch_node_interact_times,
+                                                                          node_interact_times=batch_neg_node_interact_times,
                                                                           edge_ids=None,
                                                                           edges_are_positive=False,
                                                                           num_neighbors=args.num_neighbors)
@@ -283,7 +300,7 @@ if __name__ == "__main__":
                     batch_neg_src_node_embeddings, batch_neg_dst_node_embeddings = \
                         model[0].compute_src_dst_node_temporal_embeddings(src_node_ids=batch_neg_src_node_ids,
                                                                           dst_node_ids=batch_neg_dst_node_ids,
-                                                                          node_interact_times=batch_node_interact_times,
+                                                                          node_interact_times=batch_neg_node_interact_times,
                                                                           num_neighbors=args.num_neighbors,
                                                                           time_gap=args.time_gap)
                 elif args.model_name in ['DyGFormer']:
@@ -299,7 +316,7 @@ if __name__ == "__main__":
                     batch_neg_src_node_embeddings, batch_neg_dst_node_embeddings = \
                         model[0].compute_src_dst_node_temporal_embeddings(src_node_ids=batch_neg_src_node_ids,
                                                                           dst_node_ids=batch_neg_dst_node_ids,
-                                                                          node_interact_times=batch_node_interact_times)
+                                                                          node_interact_times=batch_neg_node_interact_times)
                 else:
                     raise ValueError(f"Wrong value for model_name {args.model_name}!")
                 
@@ -316,11 +333,12 @@ if __name__ == "__main__":
                                                   src_emb=batch_neg_src_node_embeddings,
                                                   dst_emb=batch_neg_dst_node_embeddings).squeeze(dim=-1)
 
+                neg_logits = negative_logits.view(len(batch_src_node_ids), -1)
+                tau = halt.compute_temperature(batch_src_node_ids, batch_node_interact_times)
+                loss_main = halt.listwise_loss(positive_logits, neg_logits, tau)
+
                 logits = torch.cat([positive_logits, negative_logits], dim=0)
                 labels = torch.cat([torch.ones_like(positive_logits), torch.zeros_like(negative_logits)], dim=0)
-
-                loss_bce = loss_func(input=logits, target=labels)
-
                 predicts = torch.nan_to_num(logits.sigmoid(), nan=0.5)
 
                 # Auxiliary drifting loss on node temporal embeddings (dst only), computed on CUDA.
@@ -336,7 +354,12 @@ if __name__ == "__main__":
                     y_pos = pos_dst_bank.sample(args.drift_pos_sample_size)
                     if y_pos is not None:
                         x = batch_dst_node_embeddings
-                        y_neg = batch_neg_dst_node_embeddings
+                        if batch_neg_dst_node_embeddings.shape[0] != batch_dst_node_embeddings.shape[0]:
+                            bsz = batch_dst_node_embeddings.shape[0]
+                            dim = batch_neg_dst_node_embeddings.shape[1]
+                            y_neg = batch_neg_dst_node_embeddings.reshape(bsz, -1, dim)[:, 0, :]
+                        else:
+                            y_neg = batch_neg_dst_node_embeddings
 
                         if not args.drift_no_normalize:
                             x = F.normalize(x, p=2, dim=1)
@@ -353,7 +376,7 @@ if __name__ == "__main__":
                         )
                         drift_loss = (V ** 2).mean()
 
-                loss = loss_bce + args.drift_weight * drift_loss
+                loss = loss_main + args.drift_weight * drift_loss
 
                 train_losses.append(loss.item())
 
@@ -363,6 +386,7 @@ if __name__ == "__main__":
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                halt.update_state(batch_src_node_ids, batch_dst_node_ids, batch_node_interact_times)
 
                 if args.drift_weight > 0 and pos_dst_bank is not None:
                     pos_dst_bank.append(batch_dst_node_embeddings)
