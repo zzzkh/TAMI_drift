@@ -61,6 +61,12 @@ def get_link_prediction_args(is_evaluation: bool = False):
     parser.add_argument('--drift_bank_size', type=int, default=65536, help='GPU ring buffer size for positive dst embeddings')
     parser.add_argument('--drift_pos_sample_size', type=int, default=256, help='how many positives to sample from bank for drifting loss')
     parser.add_argument('--drift_no_normalize', action='store_true', default=False, help='disable L2-normalization before drifting loss')
+    parser.add_argument('--halt_num_negatives', type=int, default=8, help='number of negatives per positive in HALT')
+    parser.add_argument('--halt_hard_ratio', type=float, default=0.3, help='ratio of hard negatives in HALT')
+    parser.add_argument('--halt_base_tau', type=float, default=0.08, help='base temperature in HALT')
+    parser.add_argument('--halt_tau_alpha', type=float, default=0.2, help='adaptive temperature strength in HALT')
+    parser.add_argument('--halt_tau_min', type=float, default=0.03, help='minimum temperature in HALT')
+    parser.add_argument('--halt_tau_max', type=float, default=0.2, help='maximum temperature in HALT')
     try:
         args = parser.parse_args()
         args.device = f'cuda:{args.gpu}' if torch.cuda.is_available() and args.gpu >= 0 else 'cpu'
